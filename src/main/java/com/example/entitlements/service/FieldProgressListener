@@ -1,0 +1,62 @@
+public class FieldProgressListener {
+
+    @PostPersist
+    @PostUpdate
+    public void updateProgress(Object entity) {
+        FieldMetadataRepository fieldMetadataRepo = SpringContext.getBean(FieldMetadataRepository.class);
+        UserFieldProgressRepository userProgressRepo = SpringContext.getBean(UserFieldProgressRepository.class);
+
+        String tableName = entity.getClass().getAnnotation(Table.class).name();
+        Long userId = extractUserId(entity);
+
+        // fetch metadata for this table
+        List<FieldMetadata> fields = fieldMetadataRepo.findByTableName(tableName);
+
+        for (FieldMetadata field : fields) {
+            Object value = getFieldValue(entity, field.getColumnName());
+            boolean completed = value != null && !value.toString().isBlank();
+
+            UserFieldProgress progress = new UserFieldProgress();
+            progress.setUserId(userId);
+            progress.setFieldId(field.getId());
+            progress.setCompleted(completed);
+
+            userProgressRepo.save(progress);
+        }
+    }
+
+    private Long extractUserId(Object entity) {
+        try {
+            Field userIdField = entity.getClass().getDeclaredField("userId");
+            userIdField.setAccessible(true);
+            return (Long) userIdField.get(entity);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to extract userId from " + entity.getClass().getSimpleName(), e);
+        }
+    }
+
+    private Object getFieldValue(Object entity, String columnName) {
+        try {
+            String fieldName = toCamelCase(columnName);
+            Field f = entity.getClass().getDeclaredField(fieldName);
+            f.setAccessible(true);
+            return f.get(entity);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    private String toCamelCase(String snake) {
+        StringBuilder result = new StringBuilder();
+        boolean upper = false;
+        for (char c : snake.toCharArray()) {
+            if (c == '_') {
+                upper = true;
+            } else {
+                result.append(upper ? Character.toUpperCase(c) : c);
+                upper = false;
+            }
+        }
+        return result.toString();
+    }
+}
