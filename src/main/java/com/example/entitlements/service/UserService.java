@@ -16,4 +16,23 @@ public class UserService {
         return userRepo.findBySoeIdAndIsActive(soeId, 1)
                 .orElseThrow(() -> new RuntimeException("User not found or inactive"));
     }
+
+     public List<UserProfile> getUsers(Long defaultManagedSegmentId,
+                                      Long roleId,
+                                      Integer level,
+                                      String searchString) {
+        // Get hierarchy string for the given managed segment
+        ManagedSegment segment = managedSegmentRepository.findById(defaultManagedSegmentId)
+                .orElseThrow(() -> new IllegalArgumentException("Invalid managed segment id"));
+
+        String[] parts = segment.getHierarchyString().split("/");
+        // Build partial string up to "level"
+        String partialHierarchy = Arrays.stream(parts)
+                .filter(p -> !p.isBlank())
+                .limit(level)
+                .collect(Collectors.joining("/", "/", ""));
+
+        return userProfileRepository.findUsersByRoleAndManagedSegment(
+                roleId, defaultManagedSegmentId, partialHierarchy, searchString);
+    }
 }
