@@ -1,0 +1,72 @@
+Workflow Design using RHPAM for Initiative Management
+1. Objective
+This document explains how to design and integrate a hierarchical workflow using Red Hat Process Automation Manager (RHPAM) for an existing Spring Boot MVC backend with an Angular frontend. The workflow manages Initiatives, Countries, Action Items (AI), and Action Steps, and ensures correct status propagation across all levels.
+2. Business Hierarchy
+Initiative
+  └── Country (Data Collection Country)
+       └── Action Item (AI)
+            └── Action Step
+
+Completion Rules:
+- All Action Steps completed → AI marked Complete
+- All AIs completed → Country marked Review Complete
+- All Countries Review Complete → Initiative marked Review Complete
+3. Architectural Principles
+- Spring Boot application remains the System of Record
+- RHPAM manages workflow orchestration and aggregation logic
+- Angular UI interacts only with Spring Boot APIs
+- Status updates are synchronized from BPM to the application database
+- Database is used for search and reporting (not BPM tables)
+4. BPM Processes Overview
+The solution uses three BPM processes:
+
+1. Initiative Process (Parent Process)
+   - Controls overall initiative lifecycle
+   - Spawns country subprocesses
+   - Aggregates country completion
+
+2. Country Process (Child Process)
+   - Manages country-level review
+   - Spawns AI subprocesses
+   - Aggregates AI completion
+
+3. AI Process (Child Process)
+   - Tracks Action Step completion
+   - Marks AI complete when all steps are done
+   - Notifies Country process
+5. Action Steps Handling
+Action Steps are not BPM processes. They are:
+- Stored and managed in the application database
+- Completed via the Angular UI
+- On completion, the Spring Boot app sends a signal to the AI BPM process
+
+This avoids high-volume BPM instances and improves performance.
+6. Status Synchronization Strategy
+Whenever a status changes inside BPM:
+- A Service Task calls a Spring Boot REST API
+- The application updates its database
+- The UI reflects the latest state from DB
+
+Example entities whose status is synchronized:
+- Initiative
+- Country
+- Action Item
+7. Search and Reporting
+Initiatives and related entities are searched using the application database.
+Example:
+SELECT * FROM initiative WHERE status = 'REVIEW_COMPLETE';
+
+BPM engine tables should never be queried directly for UI or reporting.
+8. Integration Flow Summary
+- UI creates Initiative → Spring Boot
+- Spring Boot starts BPM workflow
+- Action Steps completed via UI
+- Spring Boot signals BPM processes
+- BPM updates status via REST callbacks
+- UI displays status from DB
+9. Benefits of This Design
+- Clear separation of concerns
+- Scalable and maintainable
+- Beginner-friendly BPM adoption
+- Easy to explain to business and technical teams
+- Future-ready for enhancements
