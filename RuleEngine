@@ -1,1 +1,246 @@
 
+Technical Design Document: Configurable Rule Engine
+1. System Overview & Architecture
+The objective of this design is to provide a scalable, database-driven Rule Engine in Java. Instead of hardcoding business rules in Java code, rules are modeled as configurable records in Oracle DB.
+
+The engine evaluates incoming assessment answers—represented as Map<String, List<String>> (where the key is a QuestionId and the value is a list of selected answers)—and evaluates them against atomic conditions grouped into logical rules.
+
+       +-----------------------+
+       |   Incoming Payload    |
+       | Map<String, List<S>>  |
+       +-----------+-----------+
+                   |
+                   v
+       +-----------------------+
+       |   Rule Engine Logic   | <---> [ Cached Rules Metadata ]
+       +-----------+-----------+
+                   |
+                   v
+       +-----------------------+
+       | Calculated Outcome    |
+       |  (Disposition Types)  |
+       +-----------------------+
+2. Oracle Database Design
+To ensure performance and scalability, rules are split into three normalized tables:
+
+RULE_DISPOSITION: Defines the target outcome/disposition.
+
+BUSINESS_RULE: Defines an individual rule under a disposition. All conditions in a rule are evaluated with AND logic. If any rule passes, the disposition is recommended (OR logic across rules).
+
+RULE_CONDITION: Defines individual criteria (EQUALS, IN, NOT_EQUALS, or custom operators like CROSS_BORDER_MATCH).
+
+Schema Definition (DDL)
+SQL
+-- 1. Disposition Master Table
+CREATE TABLE RULE_DISPOSITION (
+    DISPOSITION_ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    DISPOSITION_NAME VARCHAR2(100) NOT NULL UNIQUE,
+    DESCRIPTION VARCHAR2(255),
+    IS_ACTIVE NUMBER(1) DEFAULT 1 NOT NULL,
+    CREATED_AT TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 2. Business Rules Table
+CREATE TABLE BUSINESS_RULE (
+    RULE_ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    DISPOSITION_ID NUMBER NOT NULL,
+    RULE_NAME VARCHAR2(100) NOT NULL,
+    PRIORITY NUMBER DEFAULT 1 NOT NULL,
+    IS_ACTIVE NUMBER(1) DEFAULT 1 NOT NULL,
+    CONSTRAINT FK_RULE_DISP FOREIGN KEY (DISPOSITION_ID) REFERENCES RULE_DISPOSITION(DISPOSITION_ID)
+);
+
+-- 3. Atomic Rule Conditions
+CREATE TABLE RULE_CONDITION (
+    CONDITION_ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    RULE_ID NUMBER NOT NULL,
+    QUESTION_ID VARCHAR2(50) NOT NULL,
+    OPERATOR VARCHAR2(30) NOT NULL, -- EQUALS, NOT_EQUALS, IN, CONTAINS_ONLY, CROSS_BORDER_MATCH
+    EXPECTED_VALUE VARCHAR2(4000) NOT NULL, -- Pipe-separated values for lists (e.g. "US|UK")
+    CONSTRAINT FK_COND_RULE FOREIGN KEY (RULE_ID) REFERENCES BUSINESS_RULE(RULE_ID)
+);
+
+CREATE INDEX IDX_COND_RULE_ID ON RULE_CONDITION(RULE_ID);
+CREATE INDEX IDX_RULE_DISP_ID ON BUSINESS_RULE(DISPOSITION_ID);
+DML Seed Data for Target Rules
+SQL
+-- Insert Dispositions
+INSERT INTO RULE_DISPOSITION (DISPOSITION_NAME, DESCRIPTION) VALUES ('Data Disclosure Validation', 'Regulator disclosures check');
+INSERT INTO RULE_DISPOSITION (DISPOSITION_NAME, DESCRIPTION) VALUES ('PIA Review Required', 'PIA assessment triggers');
+INSERT INTO RULE_DISPOSITION (DISPOSITION_NAME, DESCRIPTION) VALUES ('No Clearance Required', 'Exemption conditions check');
+
+-- Disposition 1: Data Disclosure Validation
+INSERT INTO BUSINESS_RULE (DISPOSITION_ID, RULE_NAME) VALUES (1, 'Rule NEW1 Disclosure Check');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) 
+VALUES (1, 'NEW1', 'EQUALS', 'Data disclosures to US regulators, foreign regulators or supervisory authorities were identified as trigger');
+
+-- Disposition 2: PIA Review Required
+-- Rule 1
+INSERT INTO BUSINESS_RULE (DISPOSITION_ID, RULE_NAME) VALUES (2, 'PIA Rule 1');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (2, '1Q7', 'EQUALS', 'Yes PIA Exists');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (2, 'A68', 'EQUALS', 'Material change');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (2, '155', 'IN', 'Internal PII|Confidential PII|Sensitive PII|Restricted');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (2, 'A14A', 'EQUALS', 'Other PI');
+
+-- Rule 2
+INSERT INTO BUSINESS_RULE (DISPOSITION_ID, RULE_NAME) VALUES (2, 'PIA Rule 2');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (3, '1Q7', 'EQUALS', 'Yes PIA Exists');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (3, 'A68', 'EQUALS', 'Material change');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (3, '155', 'IN', 'Internal PII|Confidential PII|Sensitive PII|Restricted');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (3, 'A14A', 'EQUALS', 'Routine PI');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (3, 'Ale3', 'NOT_EQUALS', 'None');
+
+-- Rule 3
+INSERT INTO BUSINESS_RULE (DISPOSITION_ID, RULE_NAME) VALUES (2, 'PIA Rule 3');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (4, '1Q7', 'EQUALS', 'No prior PIA Exists');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (4, '155', 'IN', 'Internal PII|Confidential PII|Sensitive PII|Restricted');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (4, 'A14A', 'EQUALS', 'Other PI');
+
+-- Rule 4
+INSERT INTO BUSINESS_RULE (DISPOSITION_ID, RULE_NAME) VALUES (2, 'PIA Rule 4');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (5, '1Q7', 'EQUALS', 'No prior PIA Exists');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (5, '155', 'IN', 'Internal PII|Confidential PII|Sensitive PII|Restricted');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (5, 'A14A', 'EQUALS', 'Other PI');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (5, 'A103', 'NOT_EQUALS', 'None');
+
+-- Disposition 3: No Clearance Required
+INSERT INTO BUSINESS_RULE (DISPOSITION_ID, RULE_NAME) VALUES (3, 'No Clearance Rule 1');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (6, 'DataCollection', 'CROSS_BORDER_MATCH', 'DataAccess');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (6, 'IQ4', 'EQUALS', 'Users from designated countries do not have access to US bulk sensitive/government related data');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (6, 'New100', 'CONTAINS_ONLY', 'The activity is limited to accessing, viewing, extracting, analyzing, monitoring, or eporting on data for the recipient''s own use and does not involve receiving an ongoing service or business function from another party.');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (6, 'New155', 'EQUALS', 'Citi Internal');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (6, 'A68A', 'EQUALS', 'No Chnage for PIA');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (6, 'NEW1', 'NOT_EQUALS', 'Data disclosures to US regulators, Foreign regulators or supervisory authorities');
+
+COMMIT;
+3. Java Implementation Architecture
+Condition Evaluator Strategy
+Java
+import java.util.*;
+import java.util.stream.Collectors;
+
+public enum Operator {
+    EQUALS {
+        @Override
+        public boolean evaluate(List<String> actual, String expected, Map<String, List<String>> context) {
+            return actual != null && actual.contains(expected);
+        }
+    },
+    NOT_EQUALS {
+        @Override
+        public boolean evaluate(List<String> actual, String expected, Map<String, List<String>> context) {
+            return actual == null || actual.isEmpty() || !actual.contains(expected);
+        }
+    },
+    IN {
+        @Override
+        public boolean evaluate(List<String> actual, String expected, Map<String, List<String>> context) {
+            if (actual == null || actual.isEmpty()) return false;
+            Set<String> expectedSet = Arrays.stream(expected.split("\\|")).map(String::trim).collect(Collectors.toSet());
+            return actual.stream().anyMatch(expectedSet::contains);
+        }
+    },
+    CONTAINS_ONLY {
+        @Override
+        public boolean evaluate(List<String> actual, String expected, Map<String, List<String>> context) {
+            return actual != null && actual.size() == 1 && actual.contains(expected);
+        }
+    },
+    CROSS_BORDER_MATCH {
+        @Override
+        public boolean evaluate(List<String> actualCollection, String dataAccessKey, Map<String, List<String>> context) {
+            if (actualCollection == null || actualCollection.isEmpty()) return false;
+            List<String> dataAccess = context.get(dataAccessKey);
+            if (dataAccess == null || dataAccess.isEmpty()) return false;
+
+            // Map DataAccess entries into collection-access pairs (e.g., "US-US" -> Collection: US, Access: US)
+            Set<String> validSameCountryPairs = actualCollection.stream()
+                    .map(country -> country + "-" + country)
+                    .collect(Collectors.toSet());
+
+            // Check if all DataAccess selections match same-country patterns
+            return validSameCountryPairs.containsAll(dataAccess);
+        }
+    };
+
+    public abstract boolean evaluate(List<String> actualValues, String expectedValue, Map<String, List<String>> context);
+}
+Data Models & Engine Execution
+Java
+public class RuleCondition {
+    private String questionId;
+    private Operator operator;
+    private String expectedValue;
+
+    public RuleCondition(String questionId, Operator operator, String expectedValue) {
+        this.questionId = questionId;
+        this.operator = operator;
+        this.expectedValue = expectedValue;
+    }
+
+    public boolean evaluate(Map<String, List<String>> payload) {
+        List<String> actualValues = payload.get(questionId);
+        return operator.evaluate(actualValues, expectedValue, payload);
+    }
+}
+
+public class BusinessRule {
+    private String ruleName;
+    private List<RuleCondition> conditions = new ArrayList<>();
+
+    public BusinessRule(String ruleName) {
+        this.ruleName = ruleName;
+    }
+
+    public void addCondition(RuleCondition condition) {
+        this.conditions.add(condition);
+    }
+
+    public boolean evaluate(Map<String, List<String>> payload) {
+        // All conditions must evaluate to TRUE (AND logic)
+        return conditions.stream().allMatch(condition -> condition.evaluate(payload));
+    }
+}
+
+public class DispositionRuleGroup {
+    private String dispositionName;
+    private List<BusinessRule> rules = new ArrayList<>();
+
+    public DispositionRuleGroup(String dispositionName) {
+        this.dispositionName = dispositionName;
+    }
+
+    public void addRule(BusinessRule rule) {
+        this.rules.add(rule);
+    }
+
+    public boolean evaluate(Map<String, List<String>> payload) {
+        // If ANY rule passes, disposition is satisfied (OR logic)
+        return rules.stream().anyMatch(rule -> rule.evaluate(payload));
+    }
+
+    public String getDispositionName() {
+        return dispositionName;
+    }
+}
+
+public class RuleEngine {
+    private final List<DispositionRuleGroup> dispositionGroups;
+
+    public RuleEngine(List<DispositionRuleGroup> dispositionGroups) {
+        this.dispositionGroups = dispositionGroups;
+    }
+
+    public List<String> process(Map<String, List<String>> payload) {
+        return dispositionGroups.stream()
+                .filter(group -> group.evaluate(payload))
+                .map(DispositionRuleGroup::getDispositionName)
+                .collect(Collectors.toList());
+    }
+}
+4. Scalability Considerations
+In-Memory Caching: Database calls per rule execution degrade throughput. Load active rules using Caffeine/Guava Cache or Spring @Cacheable and reload on metadata changes.
+
+Extensibility via Custom Operators: Complex cross-field checks (such as CROSS_BORDER_MATCH) can be implemented as isolated strategies without disrupting standard evaluation flows.
+
+Stateless Processing: The RuleEngine processing pipeline is thread-safe and stateless, allowing horizontal scaling across microservices.
