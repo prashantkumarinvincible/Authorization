@@ -243,4 +243,299 @@ In-Memory Caching: Database calls per rule execution degrade throughput. Load ac
 
 Extensibility via Custom Operators: Complex cross-field checks (such as CROSS_BORDER_MATCH) can be implemented as isolated strategies without disrupting standard evaluation flows.
 
+=========================================================== UPADTED ==============================================================================================
+
+Here is the updated, complete technical design document addressing the justification tracking, the clarification on DispositionRuleGroup Initialization, and handling complex nested boolean expressions natively via the database configuration.
+
+Technical Design Document v2: Configurable Rule Engine
+1. Handling Complex Grouping Logic & Justifications
+To handle complex boolean expressions such as (Q1 = Yes AND Q2 = NO) OR (Q1 = Yes AND Q3 = Yes), we use standard Disjunctive Normal Form (DNF).
+
+In DNF, complex conditions are broken down into an OR of ANDs.
+
+AND Logic: Modeled across multiple rows in the RULE_CONDITION table sharing the same RULE_ID.
+
+OR Logic: Modeled as separate RULE_ID records targeting the same DISPOSITION_ID.
+
+Each individual BUSINESS_RULE represents a distinct path to achieving a disposition and contains its own dedicated Justification Template.
+
+2. Updated Oracle Database Design
+Schema Definition (DDL)
+SQL
+-- 1. Disposition Master Table
+CREATE TABLE RULE_DISPOSITION (
+    DISPOSITION_ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    DISPOSITION_NAME VARCHAR2(100) NOT NULL UNIQUE,
+    DESCRIPTION VARCHAR2(255),
+    IS_ACTIVE NUMBER(1) DEFAULT 1 NOT NULL
+);
+
+-- 2. Business Rules Table (Now includes Justification Templates)
+CREATE TABLE BUSINESS_RULE (
+    RULE_ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    DISPOSITION_ID NUMBER NOT NULL,
+    RULE_NAME VARCHAR2(100) NOT NULL,
+    JUSTIFICATION_TEMPLATE VARCHAR2(1000) NOT NULL, -- Dynamic tokens like {Q1} can be used
+    PRIORITY NUMBER DEFAULT 1 NOT NULL,
+    IS_ACTIVE NUMBER(1) DEFAULT 1 NOT NULL,
+    CONSTRAINT FK_RULE_DISP FOREIGN KEY (DISPOSITION_ID) REFERENCES RULE_DISPOSITION(DISPOSITION_ID)
+);
+
+-- 3. Atomic Rule Conditions
+CREATE TABLE RULE_CONDITION (
+    CONDITION_ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    RULE_ID NUMBER NOT NULL,
+    QUESTION_ID VARCHAR2(50) NOT NULL,
+    OPERATOR VARCHAR2(30) NOT NULL, -- EQUALS, NOT_EQUALS, IN, CONTAINS_ONLY, CROSS_BORDER_MATCH
+    EXPECTED_VALUE VARCHAR2(4000) NOT NULL,
+    CONSTRAINT FK_COND_RULE FOREIGN KEY (RULE_ID) REFERENCES BUSINESS_RULE(RULE_ID)
+);
+
+CREATE INDEX IDX_COND_RULE_ID ON RULE_CONDITION(RULE_ID);
+CREATE INDEX IDX_RULE_DISP_ID ON BUSINESS_RULE(DISPOSITION_ID);
+Modeling the Complex Scenario Example
+To model (Q1 = "Yes" AND Q2 = "No") OR (Q1 = "Yes" AND Q3 = "Yes") for a disposition:
+
+SQL
+-- Insert Disposition
+INSERT INTO RULE_DISPOSITION (DISPOSITION_NAME, DESCRIPTION) VALUES ('Sample Compliance Check', 'Example Complex Logic');
+
+-- Path A (Rule ID 10)
+INSERT INTO BUSINESS_RULE (RULE_ID, DISPOSITION_ID, RULE_NAME, JUSTIFICATION_TEMPLATE) 
+VALUES (10, 1, 'Path A: Q1 and Q2 Match', 'Triggered because Q1 was {Q1} and Q2 was {Q2}.');
+
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (10, 'Q1', 'EQUALS', 'Yes');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (10, 'Q2', 'EQUALS', 'No');
+
+-- Path B (Rule ID 11)
+INSERT INTO BUSINESS_RULE (RULE_ID, DISPOSITION_ID, RULE_NAME, JUSTIFICATION_TEMPLATE) 
+VALUES (11, 1, 'Path B: Q1 and Q3 Match', 'Triggered because Q1 was {Q1} and Q3 was {Q3}.');
+
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (11, 'Q1', 'EQUALS', 'Yes');
+INSERT INTO RULE_CONDITION (RULE_ID, QUESTION_ID, OPERATOR, EXPECTED_VALUE) VALUES (11, 'Q3', 'EQUALS', 'Yes');
+3. Java Implementation Architecture
+Result Output DTO
+Instead of just returning a List<String>, the engine now returns an evaluation result matching the calculated disposition with its specific justification text.
+
+Java
+public class EvaluationResult {
+    private final String dispositionName;
+    private final String justification;
+
+    public EvaluationResult(String dispositionName, String justification) {
+        this.dispositionName = dispositionName;
+        this.justification = justification;
+    }
+
+    public String getDispositionName() { return dispositionName; }
+    public String getJustification() { return justification; }
+
+    @Override
+    public String toString() {
+        return "Disposition: " + dispositionName + " | Justification: " + justification;
+    }
+}
+Condition Evaluator Strategy
+Java
+import java.util.*;
+import java.util.stream.Collectors;
+
+public enum Operator {
+    EQUALS {
+        @Override
+        public boolean evaluate(List<String> actual, String expected, Map<String, List<String>> context) {
+            return actual != null && actual.contains(expected);
+        }
+    },
+    NOT_EQUALS {
+        @Override
+        public boolean evaluate(List<String> actual, String expected, Map<String, List<String>> context) {
+            return actual == null || actual.isEmpty() || !actual.contains(expected);
+        }
+    },
+    IN {
+        @Override
+        public boolean evaluate(List<String> actual, String expected, Map<String, List<String>> context) {
+            if (actual == null || actual.isEmpty()) return false;
+            Set<String> expectedSet = Arrays.stream(expected.split("\\|")).map(String::trim).collect(Collectors.toSet());
+            return actual.stream().anyMatch(expectedSet::contains);
+        }
+    },
+    CONTAINS_ONLY {
+        @Override
+        public boolean evaluate(List<String> actual, String expected, Map<String, List<String>> context) {
+            return actual != null && actual.size() == 1 && actual.contains(expected);
+        }
+    },
+    CROSS_BORDER_MATCH {
+        @Override
+        public boolean evaluate(List<String> actualCollection, String dataAccessKey, Map<String, List<String>> context) {
+            if (actualCollection == null || actualCollection.isEmpty()) return false;
+            List<String> dataAccess = context.get(dataAccessKey);
+            if (dataAccess == null || dataAccess.isEmpty()) return false;
+
+            Set<String> validSameCountryPairs = actualCollection.stream()
+                    .map(country -> country + "-" + country)
+                    .collect(Collectors.toSet());
+
+            return validSameCountryPairs.containsAll(dataAccess);
+        }
+    };
+
+    public abstract boolean evaluate(List<String> actualValues, String expectedValue, Map<String, List<String>> context);
+}
+Data Models with Justification Formulation
+Java
+public class RuleCondition {
+    private final String questionId;
+    private final Operator operator;
+    private final String expectedValue;
+
+    public RuleCondition(String questionId, Operator operator, String expectedValue) {
+        this.questionId = questionId;
+        this.operator = operator;
+        this.expectedValue = expectedValue;
+    }
+
+    public boolean evaluate(Map<String, List<String>> payload) {
+        List<String> actualValues = payload.get(questionId);
+        return operator.evaluate(actualValues, expectedValue, payload);
+    }
+}
+
+public class BusinessRule {
+    private final String ruleName;
+    private final String justificationTemplate;
+    private final List<RuleCondition> conditions = new ArrayList<>();
+
+    public BusinessRule(String ruleName, String justificationTemplate) {
+        this.ruleName = ruleName;
+        this.justificationTemplate = justificationTemplate;
+    }
+
+    public void addCondition(RuleCondition condition) {
+        this.conditions.add(condition);
+    }
+
+    public boolean evaluate(Map<String, List<String>> payload) {
+        return conditions.stream().allMatch(condition -> condition.evaluate(payload));
+    }
+
+    public String buildJustification(Map<String, List<String>> payload) {
+        String template = this.justificationTemplate;
+        for (Map.Entry<String, List<String>> entry : payload.entrySet()) {
+            String placeholder = "{" + entry.getKey() + "}";
+            if (template.contains(placeholder)) {
+                template = template.replace(placeholder, String.join(", ", entry.getValue()));
+            }
+        }
+        return template;
+    }
+}
+4. Understanding & Initializing DispositionRuleGroup
+What is DispositionRuleGroup?
+It is a domain-driven container object. Instead of forcing the main processing engine loop to flatly evaluate hundreds of isolated business rules sequentially, it clusters rules under their intended target Disposition.
+
+Where and How is it Initialized?
+It is initialized at application boot time (or via a scheduled cache eviction routine) inside a Repository/Loader Class that maps relational rows from the Oracle Database into clustered domain objects.
+
+Java
+public class DispositionRuleGroup {
+    private final String dispositionName;
+    private final List<BusinessRule> rules = new ArrayList<>();
+
+    public DispositionRuleGroup(String dispositionName) {
+        this.dispositionName = dispositionName;
+    }
+
+    public void addRule(BusinessRule rule) {
+        this.rules.add(rule);
+    }
+
+    // Evaluates rules and returns the first matching passing rule configuration
+    public Optional<BusinessRule> evaluateAndGetMatchingRule(Map<String, List<String>> payload) {
+        return rules.stream().filter(rule -> rule.evaluate(payload)).findFirst();
+    }
+
+    public String getDispositionName() { return dispositionName; }
+}
+Database Rule Loader (The Initialization Layer)
+This service executes a joined database query to cleanly reconstruct the structure into memory.
+
+Java
+import java.sql.*;
+import java.util.*;
+
+public class DatabaseRuleLoader {
+
+    private final Connection connection;
+
+    public DatabaseRuleLoader(Connection connection) {
+        this.connection = connection;
+    }
+
+    public List<DispositionRuleGroup> loadRulesFromDb() throws SQLException {
+        String query = "SELECT d.DISPOSITION_NAME, r.RULE_ID, r.RULE_NAME, r.JUSTIFICATION_TEMPLATE, " +
+                       "c.QUESTION_ID, c.OPERATOR, c.EXPECTED_VALUE " +
+                       "FROM RULE_DISPOSITION d " +
+                       "JOIN BUSINESS_RULE r ON d.DISPOSITION_ID = r.DISPOSITION_ID " +
+                       "JOIN RULE_CONDITION c ON r.RULE_ID = c.RULE_ID " +
+                       "WHERE d.IS_ACTIVE = 1 AND r.IS_ACTIVE = 1";
+
+        Map<String, DispositionRuleGroup> groupMap = new LinkedHashMap<>();
+        Map<Integer, BusinessRule> ruleMap = new HashMap<>();
+
+        try (PreparedStatement stmt = connection.prepareStatement(query);
+             ResultSet rs = stmt.executeQuery()) {
+
+            while (rs.next()) {
+                String dispName = rs.getString("DISPOSITION_NAME");
+                int ruleId = rs.getInt("RULE_ID");
+                String ruleName = rs.getString("RULE_NAME");
+                String template = rs.getString("JUSTIFICATION_TEMPLATE");
+                String questionId = rs.getString("QUESTION_ID");
+                String operatorStr = rs.getString("OPERATOR");
+                String expectedValue = rs.getString("EXPECTED_VALUE");
+
+                // 1. Compute group container
+                DispositionRuleGroup group = groupMap.computeIfAbsent(dispName, DispositionRuleGroup::new);
+
+                // 2. Compute rule entity within group
+                BusinessRule rule = ruleMap.computeIfAbsent(ruleId, id -> {
+                    BusinessRule newRule = new BusinessRule(ruleName, template);
+                    group.addRule(newRule);
+                    return newRule;
+                });
+
+                // 3. Attach standard parsed conditions
+                rule.addCondition(new RuleCondition(questionId, Operator.valueOf(operatorStr), expectedValue));
+            }
+        }
+        return new ArrayList!(groupMap.values());
+    }
+}
+Rule Engine Processing Entry Point
+Java
+public class RuleEngine {
+    private final List<DispositionRuleGroup> dispositionGroups;
+
+    public RuleEngine(List<DispositionRuleGroup> dispositionGroups) {
+        this.dispositionGroups = dispositionGroups;
+    }
+
+    public List<EvaluationResult> process(Map<String, List<String>> payload) {
+        List<EvaluationResult> results = new ArrayList<>();
+
+        for (DispositionRuleGroup group : dispositionGroups) {
+            Optional<BusinessRule> matchingRule = group.evaluateAndGetMatchingRule(payload);
+            if (matchingRule.isPresent()) {
+                BusinessRule rule = matchingRule.get();
+                String justification = rule.buildJustification(payload);
+                results.add(new EvaluationResult(group.getDispositionName(), justification));
+            }
+        }
+        return results;
+    }
+}
+
 Stateless Processing: The RuleEngine processing pipeline is thread-safe and stateless, allowing horizontal scaling across microservices.
