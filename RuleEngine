@@ -539,3 +539,205 @@ public class RuleEngine {
 }
 
 Stateless Processing: The RuleEngine processing pipeline is thread-safe and stateless, allowing horizontal scaling across microservices.
+
+==========================================================PKOFTABLE
+
+That is an excellent architectural suggestion. If you already have existing master tables for Dispositions and Clearances, duplicating that data into the Rule Engine schema is an anti-pattern.
+
+Using a Polymorphic Association (storing the Target_Table and Target_PK) is the standard enterprise way to handle this. It allows the Rule Engine to remain completely decoupled and generic, acting simply as a pointer to your existing master data.
+
+Here is the fully updated Technical Design Document incorporating this polymorphic design.
+
+Technical Design Document v4: Polymorphic Configurable Rule Engine
+1. System Overview & Architecture
+This design provides a highly scalable, domain-agnostic Rule Engine. It uses a polymorphic mapping strategy to link rules to outcomes that exist in external application tables (e.g., DISPOSITION_MASTER, CLEARANCE_MASTER).
+
+Fact Map: Map<String, List<String>> containing incoming attributes.
+
+Business Rule: Contains atomic conditions and points to a generic target using TARGET_TABLE and TARGET_PK.
+
+Evaluation Result: The engine returns the target reference (Table Name + PK) and a justification. The calling application uses this reference to fetch the actual master record.
+
+2. Oracle Database Design (Polymorphic Model)
+Since the outcome master tables already exist elsewhere, we only need two tables for the engine itself.
+
+Schema Definition (DDL)
+SQL
+-- 1. Business Rules Table (Polymorphic Link to Existing Masters)
+CREATE TABLE BUSINESS_RULE (
+    RULE_ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    TARGET_TABLE VARCHAR2(100) NOT NULL, -- e.g., 'DISPOSITION_MASTER', 'CLEARANCE_MASTER'
+    TARGET_PK VARCHAR2(100) NOT NULL,    -- The Primary Key of the record in the target table
+    RULE_NAME VARCHAR2(100) NOT NULL,
+    JUSTIFICATION_TEMPLATE VARCHAR2(1000) NOT NULL, 
+    PRIORITY NUMBER DEFAULT 1 NOT NULL,
+    IS_ACTIVE NUMBER(1) DEFAULT 1 NOT NULL
+);
+
+-- 2. Atomic Rule Conditions
+CREATE TABLE RULE_CONDITION (
+    CONDITION_ID NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    RULE_ID NUMBER NOT NULL,
+    ATTRIBUTE_NAME VARCHAR2(100) NOT NULL, 
+    OPERATOR VARCHAR2(30) NOT NULL,        
+    EXPECTED_VALUE VARCHAR2(4000) NOT NULL,
+    CONSTRAINT FK_COND_RULE FOREIGN KEY (RULE_ID) REFERENCES BUSINESS_RULE(RULE_ID)
+);
+
+-- Indexes for grouping and lookups
+CREATE INDEX IDX_RULE_TARGET ON BUSINESS_RULE(TARGET_TABLE, TARGET_PK);
+CREATE INDEX IDX_COND_RULE ON RULE_CONDITION(RULE_ID);
+Note on Referential Integrity: Because TARGET_TABLE is dynamic, you cannot enforce a hard Foreign Key constraint at the database level. Integrity must be managed at the application level (e.g., preventing deletion of a Disposition if rules are mapped to it).
+
+3. Java Implementation Architecture (Core Library)
+Output Result DTO
+The result now returns the polymorphic reference so the caller knows exactly which master record was triggered.
+
+Java
+public class EvaluationResult {
+    private final String targetTable;
+    private final String targetPk;
+    private final String justification;
+
+    public EvaluationResult(String targetTable, String targetPk, String justification) {
+        this.targetTable = targetTable;
+        this.targetPk = targetPk;
+        this.justification = justification;
+    }
+
+    public String getTargetTable() { return targetTable; }
+    public String getTargetPk() { return targetPk; }
+    public String getJustification() { return justification; }
+}
+Domain Models
+The Operator, RuleCondition, and BusinessRule classes remain largely the same, but we update the grouping logic to group by the target reference.
+
+Java
+// BusinessRule now holds the Target info instead of the DB Schema
+public class BusinessRule {
+    private final String ruleName;
+    private final String targetTable;
+    private final String targetPk;
+    private final String justificationTemplate;
+    private final List<RuleCondition> conditions = new ArrayList<>();
+
+    public BusinessRule(String ruleName, String targetTable, String targetPk, String justificationTemplate) {
+        this.ruleName = ruleName;
+        this.targetTable = targetTable;
+        this.targetPk = targetPk;
+        this.justificationTemplate = justificationTemplate;
+    }
+
+    public void addCondition(RuleCondition condition) { this.conditions.add(condition); }
+
+    public boolean evaluate(Map<String, List<String>> facts) {
+        return conditions.stream().allMatch(condition -> condition.evaluate(facts));
+    }
+    
+    // Justification builder omitted for brevity (same as V3)
+    public String buildJustification(Map<String, List<String>> facts) { /* ... */ }
+
+    public String getTargetTable() { return targetTable; }
+    public String getTargetPk() { return targetPk; }
+}
+Grouping logic for the Engine
+Instead of grouping by Outcome Name, we group by the unique combination of Target_Table + Target_PK.
+
+Java
+public class RuleTargetGroup {
+    private final String targetTable;
+    private final String targetPk;
+    private final List<BusinessRule> rules = new ArrayList<>();
+
+    public RuleTargetGroup(String targetTable, String targetPk) {
+        this.targetTable = targetTable;
+        this.targetPk = targetPk;
+    }
+
+    public void addRule(BusinessRule rule) { this.rules.add(rule); }
+
+    public Optional<BusinessRule> evaluateAndGetMatchingRule(Map<String, List<String>> facts) {
+        return rules.stream().filter(rule -> rule.evaluate(facts)).findFirst();
+    }
+
+    public String getTargetTable() { return targetTable; }
+    public String getTargetPk() { return targetPk; }
+}
+The Engine Entry Point
+Java
+public class RuleEngine {
+    private final List<RuleTargetGroup> targetGroups;
+
+    public RuleEngine(List<RuleTargetGroup> targetGroups) {
+        this.targetGroups = targetGroups;
+    }
+
+    public List<EvaluationResult> process(Map<String, List<String>> facts) {
+        List<EvaluationResult> results = new ArrayList<>();
+
+        for (RuleTargetGroup group : targetGroups) {
+            Optional<BusinessRule> matchingRule = group.evaluateAndGetMatchingRule(facts);
+            if (matchingRule.isPresent()) {
+                BusinessRule rule = matchingRule.get();
+                String justification = rule.buildJustification(facts);
+                
+                results.add(new EvaluationResult(group.getTargetTable(), group.getTargetPk(), justification));
+            }
+        }
+        return results;
+    }
+}
+4. Integration & The SPI Layer
+Your SPI interface will now fetch rules based on the target table the calling service cares about.
+
+The SPI Interface
+Java
+package com.yourcompany.project.service.ruleengine.spi;
+import com.yourcompany.project.service.ruleengine.core.RuleTargetGroup;
+import java.util.List;
+
+public interface RuleProvider {
+    // e.g., loadRulesForTable("DISPOSITION_MASTER")
+    List<RuleTargetGroup> loadRulesForTable(String targetTable); 
+}
+The Calling Application (Bridging Engine Output to Master Data)
+When your application service calls the Rule Engine, it uses the targetPk returned by the engine to fetch the rich details from your existing Master tables.
+
+Java
+@Service
+public class AssessmentService {
+
+    private final RuleEngine dispositionEngine;
+    private final DispositionMasterRepository dispositionRepo; // Your existing JPA Repo
+
+    public AssessmentService(RuleProvider ruleProvider, DispositionMasterRepository dispositionRepo) {
+        this.dispositionRepo = dispositionRepo;
+        // Initialize engine with only rules pointing to DISPOSITION_MASTER
+        this.dispositionEngine = new RuleEngine(ruleProvider.loadRulesForTable("DISPOSITION_MASTER"));
+    }
+
+    public AssessmentResponse evaluatePia(Map<String, List<String>> facts) {
+        List<EvaluationResult> ruleResults = dispositionEngine.process(facts);
+        
+        List<String> finalDispositions = new ArrayList<>();
+        
+        for (EvaluationResult result : ruleResults) {
+            // Use the returned PK to fetch the existing Master Record
+            Long masterPk = Long.valueOf(result.getTargetPk());
+            
+            dispositionRepo.findById(masterPk).ifPresent(masterRecord -> {
+                // Log justification, map master data, etc.
+                System.out.println("Triggered: " + masterRecord.getName() + " | Reason: " + result.getJustification());
+                finalDispositions.add(masterRecord.getName());
+            });
+        }
+        
+        return new AssessmentResponse(finalDispositions);
+    }
+}
+5. Summary of Architecture Benefits
+Zero Duplication: Your engine strictly manages logic, while your application strictly manages master data.
+
+Highly Reusable: If a new team wants to use the engine for FRAUD_ALERT_MASTER, they simply insert rules with TARGET_TABLE = 'FRAUD_ALERT_MASTER' and map their PKs. The pure Java engine requires zero code changes.
+
+Library Ready: This package (com.yourcompany.project.service.ruleengine) is entirely self-contained and ready to be compiled into a standalone .jar file whenever required.
